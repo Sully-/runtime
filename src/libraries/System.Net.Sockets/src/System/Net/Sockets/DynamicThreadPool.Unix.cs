@@ -18,6 +18,10 @@ namespace System.Net.Sockets
     {
         private static DynamicThreadPoolEventSource? s_dynamicThreadPoolEventSource;
         private PollingCounter? _dynamicThreadPoolQueueCounter;
+        private PollingCounter? _dynamicThreadPoolEnqueuedWorkItems;
+        private PollingCounter? _dynamicThreadPoolProcessedWorkItems;
+        private PollingCounter? _dynamicThreadPoolAliveWorkers;
+
         public static void Initialize()
         {
             s_dynamicThreadPoolEventSource = new DynamicThreadPoolEventSource();
@@ -27,6 +31,9 @@ namespace System.Net.Sockets
             if (command.Command == EventCommand.Enable)
             {
                 _dynamicThreadPoolQueueCounter ??= new PollingCounter("dynamic-threadpool-queue-length", this, () => DynamicThreadPool.IOThreadPool.pendingWorkItemCount()) { DisplayName = "Dynamic ThreadPool Queue Length" };
+                _dynamicThreadPoolEnqueuedWorkItems ??= new PollingCounter("dynamic-threadpool-enqueued-work-items", this, ()=> DynamicThreadPool.IOThreadPool.QueuedWorkItems) { DisplayName = "Dynamic ThreadPool Enqued Work Items" };
+                _dynamicThreadPoolProcessedWorkItems ??= new PollingCounter("dynamic-threadpool-processed-work-items", this, () => DynamicThreadPool.IOThreadPool.QueuedWorkItems) { DisplayName = "Dynamic ThreadPool Processed Work Items" };
+                _dynamicThreadPoolAliveWorkers ??= new PollingCounter("dynamic-threadpool-alive-workers", this, () => DynamicThreadPool.IOThreadPool.AliveWorkers) { DisplayName = "Dynamic ThreadPool Alive Workers" };
             }
         }
     }
@@ -50,6 +57,11 @@ namespace System.Net.Sockets
         private readonly ConcurrentQueue<(WaitCallback callback, object state)> _queue;
         private readonly ConcurrentStack<Worker> _pendingWorkers;
 
+        private int _processedWorkItems;
+        public int ProcessedWorkItems => _processedWorkItems;
+        private int _queuedWorkItems;
+        public int QueuedWorkItems => _queuedWorkItems;
+
         public DynamicThreadPool(int minSize)
         {
             _queue = new ConcurrentQueue<(WaitCallback callback, object state)>();
@@ -71,6 +83,7 @@ namespace System.Net.Sockets
 
         public void QueueWorkItem(WaitCallback callback, object state)
         {
+            Interlocked.Increment(ref _queuedWorkItems);
             _queue.Enqueue((callback, state));
             TryWakeUpWorker();
         }
@@ -177,6 +190,7 @@ namespace System.Net.Sockets
                 {
                 }
 
+                Interlocked.Increment(ref _processedWorkItems);
                 return true;
             }
 
