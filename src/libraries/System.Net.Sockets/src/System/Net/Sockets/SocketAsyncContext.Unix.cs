@@ -33,8 +33,6 @@ namespace System.Net.Sockets
 
     internal sealed class SocketAsyncContext
     {
-        private static DynamicThreadPool IOThreadPool = new DynamicThreadPool(Environment.ProcessorCount * 2);
-
         // Cached operation instances for operations commonly repeated on the same socket instance,
         // e.g. async accepts, sends/receives with single and multiple buffers.  More can be
         // added in the future if necessary, at the expense of extra fields here.  With a larger
@@ -253,7 +251,7 @@ namespace System.Net.Sockets
                     // we can't pool the object, as ProcessQueue may still have a reference to it, due to
                     // using a pattern whereby it takes the lock to grab an item, but then releases the lock
                     // to do further processing on the item that's still in the list.
-                    IOThreadPool.QueueWorkItem(s => ((AsyncOperation)s!).InvokeCallback(allowPooling: false), this);
+                    DynamicThreadPool.IOThreadPool.QueueWorkItem(s => ((AsyncOperation)s!).InvokeCallback(allowPooling: false), this);
                 }
 
                 Trace("Exit");
@@ -283,7 +281,7 @@ namespace System.Net.Sockets
                 Debug.Assert(Event == null);
 
                 // Async operation.  Process the IO on the threadpool.
-                IOThreadPool.QueueWorkItem(this);
+                DynamicThreadPool.IOThreadPool.QueueWorkItem(this);
             }
 
             public void Process() => ((IThreadPoolWorkItem)this).Execute();
@@ -2137,190 +2135,5 @@ namespace System.Net.Sockets
         }
 
         public static string IdOf(object o) => o == null ? "(null)" : $"{o.GetType().Name}#{o.GetHashCode():X2}";
-    }
-
-    internal class DynamicThreadPool
-    {
-        private long _createdWorkers;
-        public long CreatedWorkers => _createdWorkers;
-
-        private int _aliveWorkers;
-        public int AliveWorkers => _aliveWorkers;
-
-        private int _reserveWorkers;
-        public int ReserveWorkers => _reserveWorkers;
-
-        private const int ReserveWorkersLimit = 5;
-        private const int WorkerTimeout = 20 * 1000;
-        private const int StartWorkerDelay = 500;
-
-        private readonly ConcurrentQueue<(WaitCallback callback, object state)> _queue;
-        private readonly ConcurrentStack<Worker> _pendingWorkers;
-
-        public DynamicThreadPool(int minSize)
-        {
-            _queue = new ConcurrentQueue<(WaitCallback callback, object state)>();
-            _pendingWorkers = new ConcurrentStack<Worker>();
-
-            new Thread(GateThread) { IsBackground = true, Name = "DynamicThreadPoolGate" }.Start();
-
-            for (int i = 0; i < minSize; i++)
-            {
-                StartWorker(Timeout.Infinite);
-            }
-        }
-
-        public void QueueWorkItem(IThreadPoolWorkItem item)
-        {
-            QueueWorkItem(i => ((IThreadPoolWorkItem)i!).Execute(), item);
-        }
-
-        public void QueueWorkItem(WaitCallback callback, object state)
-        {
-            _queue.Enqueue((callback, state));
-            TryWakeUpWorker();
-        }
-
-        private bool TryWakeUpWorker()
-        {
-            if (_queue.IsEmpty)
-            {
-                return true;
-            }
-
-            // There's something in the queue. Let's try to wake up a worker.
-            while (_pendingWorkers.TryPop(out var worker))
-            {
-                if (worker.TryWakeUp())
-                {
-                    // At least one worker is awake, the action will be dequeued eventually
-                    return true;
-                }
-
-                if (_queue.IsEmpty)
-                {
-                    // No need to wake up anyone, as the items already got processed
-                    return true;
-                }
-            }
-
-            // There's still something in the queue, and we failed to wake up a worker
-            return false;
-        }
-
-        private void GateThread()
-        {
-            // The gate thread adds new worker to the thread pool when needed
-            while (true)
-            {
-                Thread.Sleep(StartWorkerDelay);
-
-                if (!TryWakeUpWorker())
-                {
-                    StartWorker(WorkerTimeout);
-                }
-            }
-        }
-
-        private void StartWorker(int timeout)
-        {
-            Interlocked.Increment(ref _createdWorkers);
-            new Thread(() => WorkerThread(timeout)) { IsBackground = true, Name = "DynamicThreadPoolWorker" }.Start();
-        }
-
-        private void WorkerThread(int timeout)
-        {
-            Interlocked.Increment(ref _aliveWorkers);
-            var worker = new Worker();
-
-            while (true)
-            {
-                // Execute items while the queue is not empty
-                if (TryExecuteItem())
-                {
-                    continue;
-                }
-
-                // Nothing left in the queue, prepare to sleep
-                worker.Event.Reset();
-                _pendingWorkers.Push(worker);
-                if (worker.Event.Wait(timeout))
-                {
-                    continue;
-                }
-
-                // Nobody wakes us up for a long time. Let's decide if the thread pool should be scaled down
-                // Workers created at startup (minSize) will never reach this line as they have infinite wait timeout
-                var reserveCount = Interlocked.Increment(ref _reserveWorkers);
-                if (reserveCount <= ReserveWorkersLimit)
-                {
-                    // Too early to scale down. This worker will wait "in reserve" until woken up
-                    worker.Event.Wait();
-                    Interlocked.Decrement(ref _reserveWorkers);
-                    continue;
-                }
-
-                // ReserveWorkersLimit is reached, we can try to exit
-                Interlocked.Decrement(ref _reserveWorkers);
-                if (worker.TryExit())
-                {
-                    Interlocked.Decrement(ref _aliveWorkers);
-                    return;
-                }
-            }
-        }
-
-        private bool TryExecuteItem()
-        {
-            if (_queue.TryDequeue(out var item))
-            {
-                try
-                {
-                    item.callback(item.state);
-                }
-                catch (Exception)
-                {
-                }
-
-                return true;
-            }
-
-            return false;
-        }
-
-        internal class Worker
-        {
-            public readonly ManualResetEventSlim Event = new ManualResetEventSlim(false);
-            private bool _hasExited;
-
-            public bool TryWakeUp()
-            {
-                lock (Event)
-                {
-                    if (!_hasExited)
-                    {
-                        Event.Set();
-                        return true;
-                    }
-                }
-
-                return false;
-            }
-
-            public bool TryExit()
-            {
-                lock (Event)
-                {
-                    if (!Event.IsSet)
-                    {
-                        _hasExited = true;
-                        Event.Dispose();
-                        return true;
-                    }
-                }
-
-                return false;
-            }
-        }
     }
 }
